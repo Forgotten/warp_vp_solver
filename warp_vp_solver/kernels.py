@@ -462,3 +462,172 @@ def copy_1d_kernel(
     """dst[i] = src[i]."""
     i = wp.tid()
     dst[i] = src[i]
+
+
+# ===========================================================================
+# AGGRESSIVE KERNELS (F5 + M3)
+# ===========================================================================
+#
+# Used by ``WarpVlasovPoissonSolver(..., aggressive=True)``.  These
+# kernels enable two structural optimizations on top of the optimized
+# path:
+#
+#   * F5 - fuse the half-step (or full-step) x advection with the
+#          v-direction trapezoidal reduction that produces ``rho``.
+#          Each thread handles one row ``i`` and accumulates the
+#          reduction in registers, avoiding a second pass over
+#          ``f_half`` from global memory.  Arithmetic order matches
+#          ``compute_rho_kernel`` exactly so the rho output is
+#          bit-exact when this replaces the unfused pair.
+#
+#   * M3 - Strang-merge the trailing half-step of one Strang sub-step
+#          and the leading half-step of the next into a single full
+#          ``X(dt)`` advection.  Note: for *linear* semi-Lagrangian
+#          interpolation, ``X(dt/2) o X(dt/2) != X(dt)`` numerically -
+#          the merged form has less interpolation diffusion - so this
+#          is a numerically *different* (and slightly more accurate)
+#          scheme than the unmerged Strang split.
+#
+# All three kernels reuse ``periodic_interp_col`` from the optimized
+# path, so they share the same per-cell interpolation arithmetic as
+# every other forward kernel in this file.
+
+
+@wp.kernel
+def semilag_x_full_kernel(
+    f_in: wp.array2d(dtype=wp.float64),
+    f_out: wp.array2d(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    nx: wp.int32,
+    period_x: wp.float64,
+):
+    """M3: full-step (``dt``) semi-Lagrangian advection in x.
+
+    Identical to ``semilag_x_kernel`` except the foot-of-characteristic
+    uses ``-vs[j] * dt`` instead of ``-0.5 * vs[j] * dt``.  Used by the
+    Strang-merged inner sub-step in the aggressive forward path.
+    """
+    i, j = wp.tid()
+    x_foot = xs[i] - vs[j] * dt
+    f_out[i, j] = periodic_interp_col(
+        f_in, j, x_foot, xs[0], dx, nx, period_x,
+    )
+
+
+@wp.kernel
+def semilag_x_rho_fused_kernel(
+    f_in: wp.array2d(dtype=wp.float64),
+    f_eq: wp.array2d(dtype=wp.float64),
+    f_half_out: wp.array2d(dtype=wp.float64),
+    rho_out: wp.array(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    dv: wp.float64,
+    nx: wp.int32,
+    nv: wp.int32,
+    period_x: wp.float64,
+):
+    """F5 (half-step + rho).
+
+    Each thread handles one row ``i``, sweeping ``j = 0..nv-1``.  For
+    each ``j`` it computes ``f_half[i, j]`` via the same periodic
+    half-step interpolation as ``semilag_x_kernel`` and accumulates the
+    trapezoidal reduction ``sum_j (f_eq[i, j] - f_half[i, j])`` in a
+    register.  At the end of the sweep it writes ``rho[i] = acc * dv``.
+
+    Arithmetic order of the rho reduction matches ``compute_rho_kernel``
+    exactly (``0.5 * end + interior sum + 0.5 * end``, multiplied by
+    ``dv``), so this kernel produces bit-identical ``f_half`` and
+    ``rho`` outputs to ``semilag_x_kernel`` followed by
+    ``compute_rho_kernel``.
+
+    Tradeoff: parallelism is ``nx`` instead of ``nx * nv``.  Sufficient
+    for typical ``nx >= 64``; on CPU it makes no practical difference.
+    """
+    i = wp.tid()
+    half = wp.float64(0.5)
+
+    # j = 0
+    x_foot0 = xs[i] - half * vs[0] * dt
+    val0 = periodic_interp_col(
+        f_in, wp.int32(0), x_foot0, xs[0], dx, nx, period_x,
+    )
+    f_half_out[i, 0] = val0
+    acc = half * (f_eq[i, 0] - val0)
+
+    # interior j
+    for jj in range(1, nv - 1):
+        x_foot = xs[i] - half * vs[jj] * dt
+        val = periodic_interp_col(
+            f_in, jj, x_foot, xs[0], dx, nx, period_x,
+        )
+        f_half_out[i, jj] = val
+        acc = acc + (f_eq[i, jj] - val)
+
+    # j = nv - 1
+    last = nv - 1
+    x_foot_l = xs[i] - half * vs[last] * dt
+    val_l = periodic_interp_col(
+        f_in, last, x_foot_l, xs[0], dx, nx, period_x,
+    )
+    f_half_out[i, last] = val_l
+    acc = acc + half * (f_eq[i, last] - val_l)
+
+    rho_out[i] = acc * dv
+
+
+@wp.kernel
+def semilag_x_full_rho_fused_kernel(
+    f_in: wp.array2d(dtype=wp.float64),
+    f_eq: wp.array2d(dtype=wp.float64),
+    f_out: wp.array2d(dtype=wp.float64),
+    rho_out: wp.array(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    dv: wp.float64,
+    nx: wp.int32,
+    nv: wp.int32,
+    period_x: wp.float64,
+):
+    """F5 + M3 (full-step + rho).
+
+    Same idea as ``semilag_x_rho_fused_kernel`` but uses the full-step
+    foot-of-characteristic ``-vs[j] * dt``.  Drives the Strang-merged
+    inner sub-step in the aggressive forward path: each iteration of
+    the time loop calls this once to advance ``X(dt)`` *and* compute
+    the next step's ``rho`` in one pass.
+    """
+    i = wp.tid()
+    half = wp.float64(0.5)
+
+    x_foot0 = xs[i] - vs[0] * dt
+    val0 = periodic_interp_col(
+        f_in, wp.int32(0), x_foot0, xs[0], dx, nx, period_x,
+    )
+    f_out[i, 0] = val0
+    acc = half * (f_eq[i, 0] - val0)
+
+    for jj in range(1, nv - 1):
+        x_foot = xs[i] - vs[jj] * dt
+        val = periodic_interp_col(
+            f_in, jj, x_foot, xs[0], dx, nx, period_x,
+        )
+        f_out[i, jj] = val
+        acc = acc + (f_eq[i, jj] - val)
+
+    last = nv - 1
+    x_foot_l = xs[i] - vs[last] * dt
+    val_l = periodic_interp_col(
+        f_in, last, x_foot_l, xs[0], dx, nx, period_x,
+    )
+    f_out[i, last] = val_l
+    acc = acc + half * (f_eq[i, last] - val_l)
+
+    rho_out[i] = acc * dv

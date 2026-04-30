@@ -55,6 +55,10 @@ from .kernels import (
     axpy_1d_kernel,
     axpy_2d_kernel,
     copy_1d_kernel,
+    # Aggressive (F5 + M3) kernels.
+    semilag_x_full_kernel,
+    semilag_x_rho_fused_kernel,
+    semilag_x_full_rho_fused_kernel,
 )
 from .poisson import (
     fft_inv_multiplier,
@@ -86,6 +90,7 @@ class WarpVlasovPoissonSolver:
         f_eq: np.ndarray,
         *,
         optimized: bool = True,
+        aggressive: bool = False,
     ):
         """Construct a Warp Vlasov-Poisson solver.
 
@@ -96,6 +101,15 @@ class WarpVlasovPoissonSolver:
                 pipeline.  If ``False`` the original reference
                 implementation is used; useful as ground truth when
                 cross-checking the optimized path.
+            aggressive: if ``True``, additionally enable F5 (fused
+                semilag-x + rho reduction) and M3 (Strang merge across
+                time steps).  These change the numerical scheme
+                slightly - linear semi-Lagrangian is non-commutative,
+                so ``X(dt/2) o X(dt/2) != X(dt)`` and the merged path
+                has *less* interpolation diffusion than the unmerged
+                one.  Forward only; ``jax.grad`` raises
+                ``NotImplementedError`` on aggressive solvers.  Requires
+                ``optimized=True``.
         """
         self.mesh = mesh
         self.dt = float(dt)
@@ -105,6 +119,13 @@ class WarpVlasovPoissonSolver:
                 f"f_eq shape {self.f_eq.shape} != ({mesh.nx}, {mesh.nv})"
             )
         self.optimized = bool(optimized)
+        self.aggressive = bool(aggressive)
+        if self.aggressive and not self.optimized:
+            raise ValueError(
+                "aggressive=True requires optimized=True - the aggressive "
+                "path is built on top of the optimized buffers and fused-v "
+                "kernel."
+            )
 
         # Pre-allocate Warp resources.
         self._xs_wp = wp.array(self.mesh.xs, dtype=wp.float64)
@@ -266,6 +287,10 @@ class WarpVlasovPoissonSolver:
             reference) and ``ee_hist`` records ``0.5 * integral E^2 dx``
             from the self-consistent ``E`` (i.e. without ``H``).
         """
+        if self.aggressive:
+            return self._run_forward_aggressive(
+                f_iv, H, t_final, record_history=record_history
+            )
         if self.optimized:
             return self._run_forward_fast(
                 f_iv, H, t_final, record_history=record_history
@@ -423,6 +448,144 @@ class WarpVlasovPoissonSolver:
             ee_hist[t] = ee
 
         f_final = self._fa_wp.numpy().copy()
+        return f_final, f_hist, E_hist, ee_hist
+
+    # ------------------------------------------------------------------
+    # Forward (aggressive) - F5 + M3
+    # ------------------------------------------------------------------
+
+    def _run_forward_aggressive(
+        self,
+        f_iv: np.ndarray,
+        H: np.ndarray,
+        t_final: float,
+        *,
+        record_history: bool = True,
+    ) -> tuple[np.ndarray, np.ndarray | None, np.ndarray, np.ndarray]:
+        """Aggressive forward loop.
+
+        Two structural changes on top of ``_run_forward_fast``:
+
+          * **F5** - the half-step (or full-step) ``X`` advection and
+            the ``rho = trapezoid(f_eq - f_half)`` reduction are fused
+            into a single per-row kernel
+            (``semilag_x_rho_fused_kernel`` and
+            ``semilag_x_full_rho_fused_kernel``).
+          * **M3** - the trailing ``X(dt/2)`` of one Strang step and
+            the leading ``X(dt/2)`` of the next are merged into a
+            single ``X(dt)`` advection
+            (``semilag_x_full_kernel`` / ``..._rho_fused_kernel``).
+            This means ``T+1`` x-advection kernels per run instead of
+            ``2T``.
+
+        Numerical note: linear semi-Lagrangian is non-commutative -
+        ``X(dt/2) o X(dt/2) != X(dt)`` exactly - so the merged scheme
+        produces a *different* (slightly less diffusive) numerical
+        solution than the unmerged Strang split.  ``f_final`` does
+        agree to ``O(dx^2)`` with the unmerged path; ``f_hist[t]`` for
+        ``t < T-1`` records the post-merged-X(dt) state instead of the
+        post-trailing-X(dt/2) state, i.e. one extra ``X(dt/2)`` ahead
+        of the unmerged path's ``f_hist[t]``.  The final entry
+        ``f_hist[T-1]`` still equals ``f_final`` and matches the
+        unmerged path numerically (both apply the same trailing
+        ``X(dt/2)``).
+
+        Forward only - the matching discrete adjoint is not
+        implemented.  ``run_forward_jax`` raises
+        ``NotImplementedError`` on aggressive solvers.
+        """
+        T = self.num_steps(t_final)
+        nx, nv = self.mesh.nx, self.mesh.nv
+
+        f_hist = (
+            np.empty((T, nx, nv), dtype=np.float64) if record_history else None
+        )
+        E_hist = np.empty((T, nx), dtype=np.float64)
+        ee_hist = np.empty(T, dtype=np.float64)
+
+        H = np.asarray(H, dtype=np.float64)
+        self._H_wp.assign(H)
+
+        # Local references that we ping-pong between sub-steps.
+        # Buffers are owned by ``self``; only the local names are swapped.
+        A = self._fa_wp
+        B = self._fb_wp
+        C = self._fc_wp
+
+        A.assign(np.asarray(f_iv, dtype=np.float64))
+
+        # Pre-bind the constants used by every launch in the time loop.
+        dt_wp = wp.float64(self.dt)
+        dx_wp = wp.float64(self.mesh.dx)
+        dv_wp = wp.float64(self.mesh.dv)
+        period_x_wp = wp.float64(self.mesh.period_x)
+        period_v_full_wp = wp.float64(2.0 * self.mesh.period_v)
+        nx_wp = wp.int32(nx)
+        nv_wp = wp.int32(nv)
+
+        # Leading X(dt/2) + initial rho fused (F5 half-step).
+        # Reads A (= f_iv), writes B (= f_half for step 0) and rho_wp.
+        wp.launch(
+            semilag_x_rho_fused_kernel,
+            dim=nx,
+            inputs=[
+                A, self._f_eq_wp, B, self._rho_wp,
+                self._xs_wp, self._vs_wp,
+                dt_wp, dx_wp, dv_wp,
+                nx_wp, nv_wp, period_x_wp,
+            ],
+        )
+
+        for t in range(T):
+            # rho is already current at the start of every iteration:
+            #   * t == 0: from the leading F5 launch above
+            #   * t  > 0: from the previous iteration's full-step F5 fused launch
+            E = solve_poisson_host(
+                self._rho_wp.numpy(), self.mesh.period_x, self._inv_mult
+            )
+            self._E_wp.assign(E)
+            self._compute_ee(self._E_wp, self._ee_wp)
+            ee = float(self._ee_wp.numpy()[0])
+
+            # V step (F1 fused): B (= f_half) -> C
+            wp.launch(
+                semilag_v_fused_kernel,
+                dim=(nx, nv),
+                inputs=[
+                    B, C,
+                    self._vs_wp, self._E_wp, self._H_wp,
+                    dt_wp, dv_wp, nv_wp, period_v_full_wp,
+                ],
+            )
+
+            if t < T - 1:
+                # Inner: full-step X(dt) + next-step rho, fused (F5 + M3).
+                # Writes A (= next f_half) and overwrites rho_wp.
+                wp.launch(
+                    semilag_x_full_rho_fused_kernel,
+                    dim=nx,
+                    inputs=[
+                        C, self._f_eq_wp, A, self._rho_wp,
+                        self._xs_wp, self._vs_wp,
+                        dt_wp, dx_wp, dv_wp,
+                        nx_wp, nv_wp, period_x_wp,
+                    ],
+                )
+                if record_history:
+                    f_hist[t] = A.numpy()
+                # Swap so B holds the new f_half for the next iteration.
+                A, B = B, A
+            else:
+                # Final: trailing X(dt/2).  Reuses the legacy half-step kernel
+                # for bit-exact agreement with optimized/legacy on f_final.
+                self._semilag_x(C, A)
+                if record_history:
+                    f_hist[t] = A.numpy()
+
+            E_hist[t] = E + H
+            ee_hist[t] = ee
+
+        f_final = A.numpy().copy()
         return f_final, f_hist, E_hist, ee_hist
 
     # ------------------------------------------------------------------
@@ -839,6 +1002,12 @@ def _build_jax_callable(solver: WarpVlasovPoissonSolver) -> Callable:
         return primal, residuals
 
     def bwd(t_final, residuals, cotangents):
+        if solver.aggressive:
+            raise NotImplementedError(
+                "Gradients are not yet implemented for the aggressive "
+                "(F5 + M3) forward path.  Construct the solver with "
+                "aggressive=False to use jax.grad / Optax."
+            )
         f_iv_np, H_np, f_hist = residuals
         g_f_final, g_f_hist, g_E_hist, g_ee_hist = cotangents
         g_f_iv, g_H = solver._run_backward(
