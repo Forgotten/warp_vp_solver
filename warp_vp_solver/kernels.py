@@ -631,3 +631,124 @@ def semilag_x_full_rho_fused_kernel(
     acc = acc + half * (f_eq[i, last] - val_l)
 
     rho_out[i] = acc * dv
+
+
+# ---------------------------------------------------------------------------
+# Tiled F5 + M3 kernels
+# ---------------------------------------------------------------------------
+#
+# The "cpu_fused" F5 kernels above launch at ``dim=nx`` so each thread
+# sweeps a whole row.  That is great on CPU but starves a GPU - at
+# nx=256 that's only 256 concurrent threads, vs 65 536 in the legacy
+# ``dim=(nx, nv)`` launch, and the strided memory access pattern stops
+# the warp from coalescing reads of ``f_in``.
+#
+# These tiled variants split the v-direction into ``num_tiles =
+# ceil(nv / tile_size)`` blocks and launch at ``dim=(nx, num_tiles)``.
+# Each ``(i, b)`` thread interpolates and writes its slice of
+# ``f_half`` and accumulates a partial trapezoid sum locally; the
+# partial sums are combined into ``rho_out`` via ``wp.atomic_add``.
+# Total parallelism climbs from ``nx`` to ``nx * num_tiles`` while
+# still avoiding the second pass over ``f_half`` from global memory.
+#
+# Caller invariants:
+#   * ``rho_out`` MUST be pre-zeroed.  The kernel only does
+#     ``atomic_add``, never an initializing write.
+#   * ``tile_size`` need not divide ``nv``; the kernel clamps the
+#     last tile via ``j_end = min(j_end, nv)``.
+#
+# Numerical note: the atomic-add reduction across tiles is not
+# arithmetic-order-deterministic, so the rho values differ from the
+# row-sweep F5 kernels by a few ULPs.  Outputs agree to ~1e-15.
+
+
+@wp.kernel
+def semilag_x_rho_tiled_fused_kernel(
+    f_in: wp.array2d(dtype=wp.float64),
+    f_eq: wp.array2d(dtype=wp.float64),
+    f_half_out: wp.array2d(dtype=wp.float64),
+    rho_out: wp.array(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    dv: wp.float64,
+    nx: wp.int32,
+    nv: wp.int32,
+    tile_size: wp.int32,
+    period_x: wp.float64,
+):
+    """Tiled F5 (half-step + rho) for the aggressive 'tiled' layout.
+
+    Launched at ``dim=(nx, num_tiles)``.  ``rho_out`` must be zeroed
+    before the launch.
+    """
+    i, b = wp.tid()
+    j_start = b * tile_size
+    j_end = j_start + tile_size
+    if j_end > nv:
+        j_end = nv
+
+    half = wp.float64(0.5)
+    acc = wp.float64(0.0)
+    last = nv - 1
+
+    for jj in range(j_start, j_end):
+        x_foot = xs[i] - half * vs[jj] * dt
+        val = periodic_interp_col(
+            f_in, jj, x_foot, xs[0], dx, nx, period_x,
+        )
+        f_half_out[i, jj] = val
+        diff = f_eq[i, jj] - val
+        if jj == 0 or jj == last:
+            acc = acc + half * diff
+        else:
+            acc = acc + diff
+
+    wp.atomic_add(rho_out, i, acc * dv)
+
+
+@wp.kernel
+def semilag_x_full_rho_tiled_fused_kernel(
+    f_in: wp.array2d(dtype=wp.float64),
+    f_eq: wp.array2d(dtype=wp.float64),
+    f_out: wp.array2d(dtype=wp.float64),
+    rho_out: wp.array(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    dv: wp.float64,
+    nx: wp.int32,
+    nv: wp.int32,
+    tile_size: wp.int32,
+    period_x: wp.float64,
+):
+    """Tiled F5 + M3 (full-step + rho) for the aggressive 'tiled' layout.
+
+    Same launch contract as ``semilag_x_rho_tiled_fused_kernel``: ``rho_out``
+    must be pre-zeroed; ``tile_size`` need not divide ``nv``.
+    """
+    i, b = wp.tid()
+    j_start = b * tile_size
+    j_end = j_start + tile_size
+    if j_end > nv:
+        j_end = nv
+
+    half = wp.float64(0.5)
+    acc = wp.float64(0.0)
+    last = nv - 1
+
+    for jj in range(j_start, j_end):
+        x_foot = xs[i] - vs[jj] * dt
+        val = periodic_interp_col(
+            f_in, jj, x_foot, xs[0], dx, nx, period_x,
+        )
+        f_out[i, jj] = val
+        diff = f_eq[i, jj] - val
+        if jj == 0 or jj == last:
+            acc = acc + half * diff
+        else:
+            acc = acc + diff
+
+    wp.atomic_add(rho_out, i, acc * dv)

@@ -352,3 +352,157 @@ def test_aggressive_forward_jax_works(small_mesh, f_eq, f0):
         jnp.asarray(f0), jnp.zeros(small_mesh.nx), 3 * 0.001,
     )
     assert all(isinstance(x, jax.Array) for x in (f_final, f_hist, E_hist, ee_hist))
+
+
+# ---------------------------------------------------------------------------
+# Aggressive layout variants (cpu_fused / gpu_safe / tiled)
+# ---------------------------------------------------------------------------
+
+
+@pytest.fixture(params=["cpu_fused", "gpu_safe", "tiled"])
+def aggressive_layout(request):
+    return request.param
+
+
+def test_invalid_aggressive_layout_raises(small_mesh, f_eq):
+    with pytest.raises(ValueError, match="aggressive_layout must be one of"):
+        WarpVlasovPoissonSolver(
+            mesh=small_mesh, dt=0.001, f_eq=f_eq,
+            aggressive=True, aggressive_layout="bogus",
+        )
+
+
+def test_invalid_tile_size_raises(small_mesh, f_eq):
+    with pytest.raises(ValueError, match="aggressive_tile_size must be positive"):
+        WarpVlasovPoissonSolver(
+            mesh=small_mesh, dt=0.001, f_eq=f_eq,
+            aggressive=True, aggressive_layout="tiled",
+            aggressive_tile_size=0,
+        )
+
+
+def test_aggressive_layout_default_is_cpu_fused(small_mesh, f_eq):
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq, aggressive=True,
+    )
+    assert s.aggressive_layout == "cpu_fused"
+
+
+def test_each_layout_runs(small_mesh, f_eq, f0, aggressive_layout):
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    H = np.zeros(small_mesh.nx)
+    t_final = 5 * 0.001
+    f_final, f_hist, E_hist, ee_hist = s.run_forward(f0, H, t_final)
+    T = s.num_steps(t_final)
+    assert f_final.shape == (small_mesh.nx, small_mesh.nv)
+    assert f_hist.shape == (T, small_mesh.nx, small_mesh.nv)
+    assert E_hist.shape == (T, small_mesh.nx)
+    assert ee_hist.shape == (T,)
+
+
+def test_layouts_agree_with_each_other(small_mesh, f_eq, f0):
+    """All three aggressive layouts should produce close-to-equal outputs.
+
+    cpu_fused and gpu_safe perform identical arithmetic up to operator
+    order in the rho reduction (gpu_safe runs the same trapezoid in a
+    separate kernel; cpu_fused fuses it).  tiled differs from both by
+    ``atomic_add`` reordering noise (~1e-15 per row).
+    """
+    H = np.zeros(small_mesh.nx)
+    t_final = 5 * 0.001
+    outs = {}
+    for layout in ("cpu_fused", "gpu_safe", "tiled"):
+        s = WarpVlasovPoissonSolver(
+            mesh=small_mesh, dt=0.001, f_eq=f_eq,
+            aggressive=True, aggressive_layout=layout,
+            aggressive_tile_size=8,
+        )
+        outs[layout] = s.run_forward(f0, H, t_final)
+
+    for layout in ("gpu_safe", "tiled"):
+        for name, ref, got in zip(
+            ("f_final", "f_hist", "E_hist", "ee_hist"),
+            outs["cpu_fused"], outs[layout],
+        ):
+            np.testing.assert_allclose(
+                got, ref, atol=1e-12, rtol=1e-12,
+                err_msg=f"{layout} vs cpu_fused on {name}",
+            )
+
+
+def test_each_layout_close_to_optimized(small_mesh, f_eq, f0, aggressive_layout):
+    """Every aggressive layout should agree with optimized to O(dx^2 * dt)."""
+    s_opt = WarpVlasovPoissonSolver(mesh=small_mesh, dt=0.001, f_eq=f_eq)
+    s_agg = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    H = np.zeros(small_mesh.nx)
+    t_final = 5 * 0.001
+    f_o, _, Eh_o, ee_o = s_opt.run_forward(f0, H, t_final)
+    f_a, _, Eh_a, ee_a = s_agg.run_forward(f0, H, t_final)
+    np.testing.assert_allclose(f_a, f_o, atol=1e-7, rtol=1e-7)
+    np.testing.assert_allclose(Eh_a, Eh_o, atol=1e-7, rtol=1e-7)
+    np.testing.assert_allclose(ee_a, ee_o, atol=1e-7, rtol=1e-7)
+
+
+def test_each_layout_mass_conservation(small_mesh, f_eq, f0, aggressive_layout):
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    H = np.zeros(small_mesh.nx)
+    f_final, _, _, _ = s.run_forward(f0, H, 10 * 0.001)
+
+    def mass(f):
+        return np.trapezoid(
+            np.trapezoid(f, small_mesh.xs, axis=0),
+            small_mesh.vs, axis=0,
+        )
+    np.testing.assert_allclose(mass(f_final), mass(f0), rtol=1e-5, atol=1e-7)
+
+
+def test_each_layout_equilibrium_fixed_point(small_mesh, f_eq, aggressive_layout):
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.05, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    H = np.zeros(small_mesh.nx)
+    f_final, _, E_hist, ee_hist = s.run_forward(f_eq, H, 5 * 0.05)
+    np.testing.assert_allclose(f_final, f_eq, atol=1e-12)
+    np.testing.assert_allclose(E_hist, 0.0, atol=1e-12)
+    np.testing.assert_allclose(ee_hist, 0.0, atol=1e-24)
+
+
+def test_tiled_with_non_dividing_tile_size(small_mesh, f_eq, f0):
+    """tile_size=10 with nv=32 -> num_tiles=4 with last tile partial.
+
+    The kernel clamps j_end to nv; the partial last tile must produce the
+    same trapezoid as the cpu_fused single-row pass.
+    """
+    s_cpu = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout="cpu_fused",
+    )
+    s_til = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout="tiled",
+        aggressive_tile_size=10,  # 10 does NOT divide nv=32
+    )
+    H = np.zeros(small_mesh.nx); t_final = 3 * 0.001
+    out_c = s_cpu.run_forward(f0, H, t_final)
+    out_t = s_til.run_forward(f0, H, t_final)
+    for name, a, b in zip(
+        ("f_final", "f_hist", "E_hist", "ee_hist"), out_c, out_t,
+    ):
+        np.testing.assert_allclose(
+            b, a, atol=1e-12, rtol=1e-12,
+            err_msg=f"tiled (size 10) vs cpu_fused on {name}",
+        )

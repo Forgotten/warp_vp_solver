@@ -59,6 +59,8 @@ from .kernels import (
     semilag_x_full_kernel,
     semilag_x_rho_fused_kernel,
     semilag_x_full_rho_fused_kernel,
+    semilag_x_rho_tiled_fused_kernel,
+    semilag_x_full_rho_tiled_fused_kernel,
 )
 from .poisson import (
     fft_inv_multiplier,
@@ -83,6 +85,8 @@ class WarpVlasovPoissonSolver:
     dt: float
     f_eq: np.ndarray
 
+    _AGGRESSIVE_LAYOUTS = ("cpu_fused", "gpu_safe", "tiled")
+
     def __init__(
         self,
         mesh: Mesh,
@@ -91,6 +95,8 @@ class WarpVlasovPoissonSolver:
         *,
         optimized: bool = True,
         aggressive: bool = False,
+        aggressive_layout: str = "cpu_fused",
+        aggressive_tile_size: int = 32,
     ):
         """Construct a Warp Vlasov-Poisson solver.
 
@@ -102,14 +108,32 @@ class WarpVlasovPoissonSolver:
                 implementation is used; useful as ground truth when
                 cross-checking the optimized path.
             aggressive: if ``True``, additionally enable F5 (fused
-                semilag-x + rho reduction) and M3 (Strang merge across
-                time steps).  These change the numerical scheme
-                slightly - linear semi-Lagrangian is non-commutative,
-                so ``X(dt/2) o X(dt/2) != X(dt)`` and the merged path
-                has *less* interpolation diffusion than the unmerged
-                one.  Forward only; ``jax.grad`` raises
-                ``NotImplementedError`` on aggressive solvers.  Requires
-                ``optimized=True``.
+                semilag-x + rho reduction) and/or M3 (Strang merge
+                across time steps), depending on ``aggressive_layout``.
+                These change the numerical scheme slightly - linear
+                semi-Lagrangian is non-commutative, so ``X(dt/2) o
+                X(dt/2) != X(dt)`` and the merged path has *less*
+                interpolation diffusion than the unmerged one.
+                Forward only; ``jax.grad`` raises
+                ``NotImplementedError`` on aggressive solvers.
+                Requires ``optimized=True``.
+            aggressive_layout: only honored when ``aggressive=True``.
+
+                * ``'cpu_fused'`` (default) - F5 + M3 with row-sweep
+                  fused kernels at ``dim=nx``.  Best on CPU; collapses
+                  GPU parallelism.
+                * ``'gpu_safe'`` - M3 only, no F5.  Uses
+                  ``semilag_x_full_kernel`` at ``dim=(nx, nv)`` and a
+                  separate ``compute_rho_kernel``.  Full GPU
+                  parallelism + coalesced access at the cost of one
+                  extra kernel launch per step.
+                * ``'tiled'`` - F5 + M3 with block-cooperative
+                  reduction.  Launches at ``dim=(nx, num_tiles)`` with
+                  ``num_tiles = ceil(nv / aggressive_tile_size)`` and
+                  combines partial sums via ``wp.atomic_add``.  A
+                  compromise between cpu_fused and gpu_safe.
+            aggressive_tile_size: tile size for ``aggressive_layout='tiled'``.
+                Defaults to 32 (one warp).  Other layouts ignore this.
         """
         self.mesh = mesh
         self.dt = float(dt)
@@ -125,6 +149,18 @@ class WarpVlasovPoissonSolver:
                 "aggressive=True requires optimized=True - the aggressive "
                 "path is built on top of the optimized buffers and fused-v "
                 "kernel."
+            )
+        if aggressive_layout not in self._AGGRESSIVE_LAYOUTS:
+            raise ValueError(
+                f"aggressive_layout must be one of "
+                f"{self._AGGRESSIVE_LAYOUTS!r}; got {aggressive_layout!r}."
+            )
+        self.aggressive_layout = aggressive_layout
+        self.aggressive_tile_size = int(aggressive_tile_size)
+        if self.aggressive_tile_size <= 0:
+            raise ValueError(
+                f"aggressive_tile_size must be positive; "
+                f"got {aggressive_tile_size}."
             )
 
         # Pre-allocate Warp resources.
@@ -224,6 +260,128 @@ class WarpVlasovPoissonSolver:
                 wp.int32(self.mesh.nx),
             ],
         )
+
+    # ------------------------------------------------------------------
+    # Aggressive layout helpers - dispatch by self.aggressive_layout
+    # ------------------------------------------------------------------
+
+    def _agg_launch_x_half_rho(
+        self,
+        src: wp.array,
+        dst: wp.array,
+        rho_wp: wp.array,
+        dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
+    ) -> None:
+        """Leading X(dt/2) + rho kernel, dispatched by ``aggressive_layout``.
+
+        * ``cpu_fused``  - single row-sweep kernel at ``dim=nx``.
+        * ``gpu_safe``   - ``semilag_x_kernel`` at ``dim=(nx, nv)`` plus a
+          separate ``compute_rho_kernel`` launch; full GPU parallelism.
+        * ``tiled``      - block-cooperative fused kernel at
+          ``dim=(nx, num_tiles)``; ``rho_wp`` is zeroed before the launch
+          because the kernel accumulates via ``atomic_add``.
+        """
+        nx, nv = self.mesh.nx, self.mesh.nv
+        if self.aggressive_layout == "cpu_fused":
+            wp.launch(
+                semilag_x_rho_fused_kernel,
+                dim=nx,
+                inputs=[
+                    src, self._f_eq_wp, dst, rho_wp,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
+                ],
+            )
+        elif self.aggressive_layout == "gpu_safe":
+            # M3 only: full-parallelism half-step + separate rho reduction.
+            wp.launch(
+                semilag_x_kernel,
+                dim=(nx, nv),
+                inputs=[
+                    src, dst,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, nx_wp, period_x_wp,
+                ],
+            )
+            wp.launch(
+                compute_rho_kernel,
+                dim=nx,
+                inputs=[self._f_eq_wp, dst, rho_wp, dv_wp, nv_wp],
+            )
+        else:  # tiled
+            tile_size_wp = wp.int32(self.aggressive_tile_size)
+            num_tiles = int(
+                np.ceil(nv / self.aggressive_tile_size)
+            )
+            rho_wp.zero_()
+            wp.launch(
+                semilag_x_rho_tiled_fused_kernel,
+                dim=(nx, num_tiles),
+                inputs=[
+                    src, self._f_eq_wp, dst, rho_wp,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, dv_wp, nx_wp, nv_wp,
+                    tile_size_wp, period_x_wp,
+                ],
+            )
+
+    def _agg_launch_x_full_rho(
+        self,
+        src: wp.array,
+        dst: wp.array,
+        rho_wp: wp.array,
+        dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
+    ) -> None:
+        """Inner X(dt) + rho kernel (M3), dispatched by ``aggressive_layout``.
+
+        Same layout contract as ``_agg_launch_x_half_rho`` but uses the
+        full-step foot-of-characteristic ``-vs[j] * dt``.  Drives the
+        Strang-merged inner sub-step so each time-loop iteration calls
+        this once instead of the trailing + leading pair.
+        """
+        nx, nv = self.mesh.nx, self.mesh.nv
+        if self.aggressive_layout == "cpu_fused":
+            wp.launch(
+                semilag_x_full_rho_fused_kernel,
+                dim=nx,
+                inputs=[
+                    src, self._f_eq_wp, dst, rho_wp,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
+                ],
+            )
+        elif self.aggressive_layout == "gpu_safe":
+            # M3 only: full-parallelism full-step + separate rho reduction.
+            wp.launch(
+                semilag_x_full_kernel,
+                dim=(nx, nv),
+                inputs=[
+                    src, dst,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, nx_wp, period_x_wp,
+                ],
+            )
+            wp.launch(
+                compute_rho_kernel,
+                dim=nx,
+                inputs=[self._f_eq_wp, dst, rho_wp, dv_wp, nv_wp],
+            )
+        else:  # tiled
+            tile_size_wp = wp.int32(self.aggressive_tile_size)
+            num_tiles = int(
+                np.ceil(nv / self.aggressive_tile_size)
+            )
+            rho_wp.zero_()
+            wp.launch(
+                semilag_x_full_rho_tiled_fused_kernel,
+                dim=(nx, num_tiles),
+                inputs=[
+                    src, self._f_eq_wp, dst, rho_wp,
+                    self._xs_wp, self._vs_wp,
+                    dt_wp, dx_wp, dv_wp, nx_wp, nv_wp,
+                    tile_size_wp, period_x_wp,
+                ],
+            )
 
     # ------------------------------------------------------------------
     # Single-step primitives that match the JAX reference exactly
@@ -523,17 +681,10 @@ class WarpVlasovPoissonSolver:
         nx_wp = wp.int32(nx)
         nv_wp = wp.int32(nv)
 
-        # Leading X(dt/2) + initial rho fused (F5 half-step).
-        # Reads A (= f_iv), writes B (= f_half for step 0) and rho_wp.
-        wp.launch(
-            semilag_x_rho_fused_kernel,
-            dim=nx,
-            inputs=[
-                A, self._f_eq_wp, B, self._rho_wp,
-                self._xs_wp, self._vs_wp,
-                dt_wp, dx_wp, dv_wp,
-                nx_wp, nv_wp, period_x_wp,
-            ],
+        # Leading X(dt/2) + initial rho, dispatched by aggressive_layout.
+        self._agg_launch_x_half_rho(
+            A, B, self._rho_wp,
+            dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
         )
 
         for t in range(T):
@@ -559,17 +710,10 @@ class WarpVlasovPoissonSolver:
             )
 
             if t < T - 1:
-                # Inner: full-step X(dt) + next-step rho, fused (F5 + M3).
-                # Writes A (= next f_half) and overwrites rho_wp.
-                wp.launch(
-                    semilag_x_full_rho_fused_kernel,
-                    dim=nx,
-                    inputs=[
-                        C, self._f_eq_wp, A, self._rho_wp,
-                        self._xs_wp, self._vs_wp,
-                        dt_wp, dx_wp, dv_wp,
-                        nx_wp, nv_wp, period_x_wp,
-                    ],
+                # Inner X(dt) + next-step rho, dispatched by aggressive_layout.
+                self._agg_launch_x_full_rho(
+                    C, A, self._rho_wp,
+                    dt_wp, dx_wp, dv_wp, nx_wp, nv_wp, period_x_wp,
                 )
                 if record_history:
                     f_hist[t] = A.numpy()
