@@ -1,0 +1,54 @@
+[project]
+name = "warp_vp_solver"
+version = "0.1.0"
+description = "Vlasov-Poisson semi-Lagrangian solver using NVIDIA Warp."
+readme = "README.md"
+requires-python = ">=3.10"
+license = { file = "LICENSE" }
+authors = [
+  { name = "Leonardo Zepeda-Núñez", email = "lzepedanunez@google.com" },
+]
+classifiers = [
+  "Programming Language :: Python :: 3",
+  "Programming Language :: Python :: 3 :: Only",
+  "License :: OSI Approved :: MIT License",
+  "Intended Audience :: Science/Research",
+  "Topic :: Scientific/Engineering :: Physics",
+  "Topic :: Scientific/Engineering :: Mathematics",
+]
+keywords = ["plasma physics", "warp", "Vlasov-Poisson", "GPU", "NVIDIA"]
+
+dependencies = [
+  "warp-lang>=1.2.0",
+  "numpy>=1.26",
+  "scipy>=1.12",
+  "matplotlib>=3.8",
+  "jax",
+  "jaxlib",
+  "optax",
+]
+
+[project.optional-dependencies]
+dev = [
+  "pytest",
+  "pytest-xdist",
+  "pylint>=2.6.0",
+]
+notebooks = [
+  "jupyter",
+  "tqdm",
+]
+
+[project.urls]
+homepage = "https://github.com/Forgotten/vlasov-poisson-warp"
+repository = "https://github.com/Forgotten/vlasov-poisson-warp"
+
+[build-system]
+requires = ["flit_core >=3.8,<4"]
+build-backend = "flit_core.buildapi"
+
+[tool.flit.module]
+name = "warp_vp_solver"
+
+[tool.flit.sdist]
+exclude = ["**/*_test.py", "tests/**"]

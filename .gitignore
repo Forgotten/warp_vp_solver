@@ -1,0 +1,51 @@
+# Byte-compiled
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Distribution / packaging
+build/
+dist/
+*.egg-info/
+*.egg
+
+# Editable installs
+pip-wheel-metadata/
+.installed.cfg
+
+# Test / type-check caches
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.tox/
+.coverage
+.coverage.*
+htmlcov/
+
+# Jupyter
+.ipynb_checkpoints/
+
+# Warp kernel cache
+warp/cache/
+
+# Editor / OS
+.DS_Store
+.idea/
+.vscode/
+*.swp
+*~
+
+# Environments
+.env
+.venv/
+env/
+venv/
+
+# Claude Code working state (local only)
+.claude/
+
+# Internal design notes (kept local, not published)
+docs/
+
+# Notebook builder script (kept local, not published)
+notebooks/_build_notebooks.py
