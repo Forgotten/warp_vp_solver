@@ -57,10 +57,12 @@ from .kernels import (
     copy_1d_kernel,
     # Aggressive (F5 + M3) kernels.
     semilag_x_full_kernel,
+    semilag_x_full_adjoint_kernel,
     semilag_x_rho_fused_kernel,
     semilag_x_full_rho_fused_kernel,
     semilag_x_rho_tiled_fused_kernel,
     semilag_x_full_rho_tiled_fused_kernel,
+    copy_2d_kernel,
 )
 from .poisson import (
     fft_inv_multiplier,
@@ -114,9 +116,10 @@ class WarpVlasovPoissonSolver:
                 semi-Lagrangian is non-commutative, so ``X(dt/2) o
                 X(dt/2) != X(dt)`` and the merged path has *less*
                 interpolation diffusion than the unmerged one.
-                Forward only; ``jax.grad`` raises
-                ``NotImplementedError`` on aggressive solvers.
-                Requires ``optimized=True``.
+                ``jax.grad`` is supported via a hand-written discrete
+                adjoint of the merged-Strang chain
+                (``_run_backward_aggressive``).  Requires
+                ``optimized=True``.
             aggressive_layout: only honored when ``aggressive=True``.
 
                 * ``'cpu_fused'`` (default) - F5 + M3 with row-sweep
@@ -648,9 +651,9 @@ class WarpVlasovPoissonSolver:
         unmerged path numerically (both apply the same trailing
         ``X(dt/2)``).
 
-        Forward only - the matching discrete adjoint is not
-        implemented.  ``run_forward_jax`` raises
-        ``NotImplementedError`` on aggressive solvers.
+        Gradients via ``run_forward_jax`` are supported through
+        ``_run_backward_aggressive``, which differentiates the
+        merged-Strang operator chain layout-agnostically.
         """
         T = self.num_steps(t_final)
         nx, nv = self.mesh.nx, self.mesh.nv
@@ -747,7 +750,17 @@ class WarpVlasovPoissonSolver:
         g_E_hist: np.ndarray,
         g_ee_hist: np.ndarray,
     ) -> tuple[np.ndarray, np.ndarray]:
-        """Backward pass dispatcher; routes to the optimized or legacy adjoint."""
+        """Backward pass dispatcher.
+
+        Routes to the aggressive merged-Strang adjoint, the optimized
+        adjoint, or the legacy reference adjoint depending on
+        ``self.aggressive`` and ``self.optimized``.
+        """
+        if self.aggressive:
+            return self._run_backward_aggressive(
+                f_iv, H, t_final, f_hist,
+                g_f_final, g_f_hist, g_E_hist, g_ee_hist,
+            )
         if self.optimized:
             return self._run_backward_fast(
                 f_iv, H, t_final, f_hist,
@@ -1092,6 +1105,239 @@ class WarpVlasovPoissonSolver:
         return g_f_iv, g_H
 
     # ------------------------------------------------------------------
+    # Backward (aggressive) - discrete adjoint of the merged-Strang scheme
+    # ------------------------------------------------------------------
+
+    def _run_backward_aggressive(
+        self,
+        f_iv: np.ndarray,
+        H: np.ndarray,
+        t_final: float,
+        f_hist: np.ndarray,
+        g_f_final: np.ndarray,
+        g_f_hist: np.ndarray,
+        g_E_hist: np.ndarray,
+        g_ee_hist: np.ndarray,
+    ) -> tuple[np.ndarray, np.ndarray]:
+        """Discrete adjoint of the aggressive (merged-Strang) forward.
+
+        Layout-agnostic: works for ``cpu_fused``, ``gpu_safe`` and
+        ``tiled``.  The X+rho fusion is purely a forward perf trick
+        and does not change the linear chain that the backward pass
+        differentiates; this method always uses the canonical
+        unfused adjoint kernels.
+
+        Forward operator chain (in the merged form):
+
+            f_half_0    = X(dt/2)(f_iv)
+            for t = 0..T-1:
+                rho_t       = trapezoid(f_eq - f_half_t, dv)
+                E_t         = Poisson(rho_t)
+                ee_t        = 0.5 * trapezoid(E_t^2, dx)
+                E_total_t   = E_t + H
+                f_post_v_t  = SemiLag_v(f_half_t, E_total_t)
+                if t < T - 1:
+                    f_half_{t+1} = X(dt)(f_post_v_t)        # M3 inner
+                else:
+                    f_final     = X(dt/2)(f_post_v_t)       # trailing
+
+        Recorded primals: ``f_hist[t]`` is ``f_half_{t+1}`` for
+        ``t < T-1`` and ``f_final`` for ``t = T-1``; ``E_hist[t]`` is
+        ``E_total_t``; ``ee_hist[t]`` is ``ee_t``.
+
+        Backward strategy:
+
+            * Cotangent on the output of step ``t``'s X advection
+              (= ``f_half_{t+1}`` for ``t < T-1`` or ``f_final`` for
+              ``t = T-1``) accumulates
+              ``g_f_hist[t]`` from the saved cotangent.
+            * Apply ``X^T`` (full or half) to lift to the cotangent
+              on ``f_post_v_t``.
+            * Apply ``V^T`` to split into a cotangent on
+              ``f_half_t`` and on ``E_total_t``.
+            * The ``E_total_t`` cotangent is passed to ``H`` (since
+              ``dE_total/dH = 1``) and to ``E_t`` (after adding the
+              ``ee_t`` and saved-``E_hist`` contributions).
+            * Apply Poisson^T then rho^T to lift back into a cotangent
+              on ``f_half_t``.
+            * That cotangent is the input to the previous step's
+              X output, so the next iteration starts with it
+              (plus the saved ``g_f_hist[t-1]``).
+            * After the loop, apply the leading ``X(dt/2)^T`` to get
+              the cotangent on ``f_iv``.
+
+        ``f_half_t`` is reconstructed from the recorded primals:
+        ``f_half_0 = X(dt/2)(f_iv)`` (recomputed) and
+        ``f_half_t = f_hist[t-1]`` for ``t > 0``.
+        """
+        T = self.num_steps(t_final)
+        nx, nv = self.mesh.nx, self.mesh.nv
+
+        f_iv = np.asarray(f_iv, dtype=np.float64)
+        H = np.asarray(H, dtype=np.float64)
+        self._H_wp.assign(H)
+
+        dt_wp = wp.float64(self.dt)
+        dx_wp = wp.float64(self.mesh.dx)
+        dv_wp = wp.float64(self.mesh.dv)
+        period_x_wp = wp.float64(self.mesh.period_x)
+        period_v_full_wp = wp.float64(2.0 * self.mesh.period_v)
+        nx_wp = wp.int32(nx)
+        nv_wp = wp.int32(nv)
+        one = wp.float64(1.0)
+
+        # Initialize cotangent on the final state (= output of step T-1's X).
+        # f_hist[T-1] equals f_final, so its saved cotangent adds in here.
+        self._g_f_wp.assign(np.asarray(g_f_final, dtype=np.float64))
+        self._g_f_hist_t_wp.assign(
+            np.asarray(g_f_hist[T - 1], dtype=np.float64)
+        )
+        wp.launch(
+            axpy_2d_kernel, dim=(nx, nv),
+            inputs=[one, self._g_f_hist_t_wp, self._g_f_wp],
+        )
+        self._g_H_wp.zero_()
+
+        for t in range(T - 1, -1, -1):
+            # Reconstruct f_half_t in self._fb_wp (used as f_in for V_adjoint
+            # and to recompute rho_t, E_t).
+            if t == 0:
+                self._fa_wp.assign(f_iv)
+                self._semilag_x(self._fa_wp, self._fb_wp)
+            else:
+                self._fb_wp.assign(
+                    np.asarray(f_hist[t - 1], dtype=np.float64)
+                )
+
+            # Recompute rho_t and E_t for this step.
+            self._compute_rho(self._fb_wp, self._rho_wp)
+            E = solve_poisson_host(
+                self._rho_wp.numpy(), self.mesh.period_x, self._inv_mult,
+            )
+            self._E_wp.assign(E)
+
+            # Apply X^T to lift cotangent on step output back to
+            # cotangent on f_post_v_t.  X(dt/2)^T for the trailing step,
+            # X(dt)^T for the merged inner steps.
+            self._g_in_wp.zero_()
+            if t == T - 1:
+                wp.launch(
+                    semilag_x_adjoint_kernel, dim=(nx, nv),
+                    inputs=[
+                        self._g_f_wp, self._g_in_wp,
+                        self._xs_wp, self._vs_wp,
+                        dt_wp, dx_wp, nx_wp, period_x_wp,
+                    ],
+                )
+            else:
+                wp.launch(
+                    semilag_x_full_adjoint_kernel, dim=(nx, nv),
+                    inputs=[
+                        self._g_f_wp, self._g_in_wp,
+                        self._xs_wp, self._vs_wp,
+                        dt_wp, dx_wp, nx_wp, period_x_wp,
+                    ],
+                )
+
+            # V^T: produces cotangents on f_half_t (g_f_half_wp) and on
+            # E_total_t (g_E_total_wp).
+            self._g_f_half_wp.zero_()
+            self._g_E_total_wp.zero_()
+            wp.launch(
+                semilag_v_fused_adjoint_kernel, dim=(nx, nv),
+                inputs=[
+                    self._g_in_wp,
+                    self._g_f_half_wp,
+                    self._g_E_total_wp,
+                    self._fb_wp,
+                    self._vs_wp, self._E_wp, self._H_wp,
+                    dt_wp, dv_wp, nv_wp, period_v_full_wp,
+                ],
+            )
+
+            # g_E_total += saved cotangent on E_hist[t].
+            self._g_E_stage_wp.assign(
+                np.asarray(g_E_hist[t], dtype=np.float64)
+            )
+            wp.launch(
+                axpy_1d_kernel, dim=nx,
+                inputs=[one, self._g_E_stage_wp, self._g_E_total_wp],
+            )
+
+            # g_H += g_E_total (since E_total = E + H, dE_total/dH = 1).
+            wp.launch(
+                axpy_1d_kernel, dim=nx,
+                inputs=[one, self._g_E_total_wp, self._g_H_wp],
+            )
+
+            # g_E starts at g_E_total, then ee_adjoint adds the ee_hist[t] contribution.
+            wp.launch(
+                copy_1d_kernel, dim=nx,
+                inputs=[self._g_E_total_wp, self._g_E_back_wp],
+            )
+            self._g_ee_wp.assign(
+                np.asarray([float(g_ee_hist[t])], dtype=np.float64)
+            )
+            wp.launch(
+                compute_ee_adjoint_kernel, dim=nx,
+                inputs=[
+                    self._g_ee_wp, self._E_wp, self._g_E_back_wp,
+                    dx_wp, nx_wp,
+                ],
+            )
+
+            # g_rho = Poisson^T g_E (host FFT).
+            g_rho_np = solve_poisson_host_adjoint(
+                self._g_E_back_wp.numpy(),
+                self.mesh.period_x,
+                self._inv_mult,
+            )
+            self._g_rho_back_wp.assign(g_rho_np)
+
+            # g_f_half += rho_adjoint(g_rho).
+            wp.launch(
+                compute_rho_adjoint_kernel, dim=(nx, nv),
+                inputs=[
+                    self._g_rho_back_wp, self._g_f_half_wp,
+                    dv_wp, nv_wp,
+                ],
+            )
+
+            # g_f_half_wp now holds the cotangent on f_half_t.
+            #
+            # If t > 0: f_half_t is the output of step (t-1)'s merged X(dt)
+            # advection, so this cotangent feeds back into the next adjoint
+            # iteration as g_f_wp, plus the saved g_f_hist[t-1].
+            if t > 0:
+                wp.launch(
+                    copy_2d_kernel, dim=(nx, nv),
+                    inputs=[self._g_f_half_wp, self._g_f_wp],
+                )
+                self._g_f_hist_t_wp.assign(
+                    np.asarray(g_f_hist[t - 1], dtype=np.float64)
+                )
+                wp.launch(
+                    axpy_2d_kernel, dim=(nx, nv),
+                    inputs=[one, self._g_f_hist_t_wp, self._g_f_wp],
+                )
+
+        # End of loop: g_f_half_wp holds cotangent on f_half_0 = X(dt/2)(f_iv).
+        # Apply X(dt/2)^T (leading half-step adjoint) to get cotangent on f_iv.
+        self._g_in_wp.zero_()
+        wp.launch(
+            semilag_x_adjoint_kernel, dim=(nx, nv),
+            inputs=[
+                self._g_f_half_wp, self._g_in_wp,
+                self._xs_wp, self._vs_wp,
+                dt_wp, dx_wp, nx_wp, period_x_wp,
+            ],
+        )
+
+        g_f_iv = self._g_in_wp.numpy().copy()
+        g_H = self._g_H_wp.numpy().copy()
+        return g_f_iv, g_H
+
+    # ------------------------------------------------------------------
     # JAX-compatible front door (jax.custom_vjp)
     # ------------------------------------------------------------------
 
@@ -1146,12 +1392,6 @@ def _build_jax_callable(solver: WarpVlasovPoissonSolver) -> Callable:
         return primal, residuals
 
     def bwd(t_final, residuals, cotangents):
-        if solver.aggressive:
-            raise NotImplementedError(
-                "Gradients are not yet implemented for the aggressive "
-                "(F5 + M3) forward path.  Construct the solver with "
-                "aggressive=False to use jax.grad / Optax."
-            )
         f_iv_np, H_np, f_hist = residuals
         g_f_final, g_f_hist, g_E_hist, g_ee_hist = cotangents
         g_f_iv, g_H = solver._run_backward(

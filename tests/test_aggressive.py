@@ -326,7 +326,9 @@ def test_aggressive_record_history_false(small_mesh, f_eq, f0):
 # ---------------------------------------------------------------------------
 
 
-def test_aggressive_grad_raises_not_implemented(small_mesh, f_eq, f0):
+def test_aggressive_grad_runs(small_mesh, f_eq, f0):
+    """jax.grad is now supported on aggressive solvers via the
+    merged-Strang discrete adjoint."""
     s_agg = WarpVlasovPoissonSolver(
         mesh=small_mesh, dt=0.001, f_eq=f_eq, aggressive=True,
     )
@@ -338,8 +340,9 @@ def test_aggressive_grad_raises_not_implemented(small_mesh, f_eq, f0):
         f_final, _, _, _ = s_agg.run_forward_jax(f_iv, H, t_final)
         return jnp.sum(f_final ** 2)
 
-    with pytest.raises(NotImplementedError, match="aggressive"):
-        jax.grad(cost)(H)
+    g = jax.grad(cost)(H)
+    assert g.shape == H.shape
+    assert np.all(np.isfinite(np.asarray(g)))
 
 
 def test_aggressive_forward_jax_works(small_mesh, f_eq, f0):
@@ -479,6 +482,133 @@ def test_each_layout_equilibrium_fixed_point(small_mesh, f_eq, aggressive_layout
     np.testing.assert_allclose(f_final, f_eq, atol=1e-12)
     np.testing.assert_allclose(E_hist, 0.0, atol=1e-12)
     np.testing.assert_allclose(ee_hist, 0.0, atol=1e-24)
+
+
+# ---------------------------------------------------------------------------
+# Aggressive gradients (jax.grad through the merged-Strang adjoint)
+# ---------------------------------------------------------------------------
+
+
+def test_each_layout_grad_runs(small_mesh, f_eq, f0, aggressive_layout):
+    """jax.grad evaluates without error on every aggressive layout."""
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    H = jnp.zeros(small_mesh.nx)
+    f_iv = jnp.asarray(f0)
+
+    def cost(H):
+        f_final, _, _, ee = s.run_forward_jax(f_iv, H, 5 * 0.001)
+        return jnp.sum(f_final ** 2) + jnp.sum(ee)
+
+    g = jax.grad(cost)(H)
+    assert g.shape == H.shape
+    assert np.all(np.isfinite(np.asarray(g)))
+
+
+def test_each_layout_grad_finite_difference_H(
+    small_mesh, f_eq, f0, aggressive_layout,
+):
+    """Adjoint gradient w.r.t. H matches a centered finite-difference probe."""
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    rng = np.random.default_rng(42)
+    H0 = 0.001 * rng.standard_normal(small_mesh.nx)
+    direction = rng.standard_normal(small_mesh.nx)
+    f_iv = jnp.asarray(f0)
+    t_final = 3 * 0.001
+
+    def cost(H):
+        _, _, _, ee = s.run_forward_jax(f_iv, H, t_final)
+        return ee[-1]
+
+    g = np.asarray(jax.grad(cost)(jnp.asarray(H0)))
+    eps = 1e-6
+    fd = (
+        float(cost(jnp.asarray(H0 + eps * direction)))
+        - float(cost(jnp.asarray(H0 - eps * direction)))
+    ) / (2 * eps)
+    ad = float(np.dot(g, direction))
+    np.testing.assert_allclose(ad, fd, rtol=1e-4, atol=1e-9)
+
+
+def test_each_layout_grad_finite_difference_f_iv(
+    small_mesh, f_eq, f0, aggressive_layout,
+):
+    """Adjoint gradient w.r.t. f_iv matches a centered finite-difference probe."""
+    s = WarpVlasovPoissonSolver(
+        mesh=small_mesh, dt=0.001, f_eq=f_eq,
+        aggressive=True, aggressive_layout=aggressive_layout,
+        aggressive_tile_size=8,
+    )
+    rng = np.random.default_rng(0)
+    H = jnp.zeros(small_mesh.nx)
+    f_iv = jnp.asarray(f0)
+    direction = rng.standard_normal(f0.shape)
+    t_final = 2 * 0.001
+
+    def cost(f_iv):
+        _, _, _, ee = s.run_forward_jax(f_iv, H, t_final)
+        return ee[-1]
+
+    g = np.asarray(jax.grad(cost)(f_iv))
+    eps = 1e-6
+    fd = (
+        float(cost(f_iv + eps * direction))
+        - float(cost(f_iv - eps * direction))
+    ) / (2 * eps)
+    ad = float(np.sum(g * direction))
+    np.testing.assert_allclose(ad, fd, rtol=1e-4, atol=1e-9)
+
+
+def test_aggressive_grads_match_across_layouts(small_mesh, f_eq, f0):
+    """All three aggressive layouts produce numerically equivalent gradients.
+
+    The forward path is layout-agnostic up to ULP-level float reordering
+    (atomic-add in tiled), and the adjoint always uses the same canonical
+    unfused kernels, so the gradients should agree to ~1e-12.
+    """
+    rng = np.random.default_rng(2)
+    H0 = 0.001 * rng.standard_normal(small_mesh.nx)
+    f_iv_j = jnp.asarray(f0)
+    H_j = jnp.asarray(H0)
+    t_final = 5 * 0.001
+
+    grads = {}
+    for layout in ("cpu_fused", "gpu_safe", "tiled"):
+        s = WarpVlasovPoissonSolver(
+            mesh=small_mesh, dt=0.001, f_eq=f_eq,
+            aggressive=True, aggressive_layout=layout,
+            aggressive_tile_size=8,
+        )
+
+        def cost_for(solver):
+            def cost(args):
+                f_iv, H = args
+                f, _, Eh, ee = solver.run_forward_jax(f_iv, H, t_final)
+                return jnp.sum(f ** 2) + jnp.sum(Eh ** 2) + jnp.sum(ee)
+            return cost
+
+        grads[layout] = jax.grad(cost_for(s))((f_iv_j, H_j))
+
+    for layout in ("gpu_safe", "tiled"):
+        np.testing.assert_allclose(
+            np.asarray(grads[layout][0]),
+            np.asarray(grads["cpu_fused"][0]),
+            atol=1e-12, rtol=1e-12,
+            err_msg=f"{layout} f_iv grad differs from cpu_fused",
+        )
+        np.testing.assert_allclose(
+            np.asarray(grads[layout][1]),
+            np.asarray(grads["cpu_fused"][1]),
+            atol=1e-12, rtol=1e-12,
+            err_msg=f"{layout} H grad differs from cpu_fused",
+        )
 
 
 def test_tiled_with_non_dividing_tile_size(small_mesh, f_eq, f0):

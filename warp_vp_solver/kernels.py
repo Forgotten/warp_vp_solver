@@ -464,6 +464,44 @@ def copy_1d_kernel(
     dst[i] = src[i]
 
 
+@wp.kernel
+def copy_2d_kernel(
+    src: wp.array2d(dtype=wp.float64),
+    dst: wp.array2d(dtype=wp.float64),
+):
+    """dst[i, j] = src[i, j]."""
+    i, j = wp.tid()
+    dst[i, j] = src[i, j]
+
+
+@wp.kernel
+def semilag_x_full_adjoint_kernel(
+    g_out: wp.array2d(dtype=wp.float64),
+    g_in: wp.array2d(dtype=wp.float64),
+    xs: wp.array(dtype=wp.float64),
+    vs: wp.array(dtype=wp.float64),
+    dt: wp.float64,
+    dx: wp.float64,
+    nx: wp.int32,
+    period_x: wp.float64,
+):
+    """Adjoint of ``semilag_x_full_kernel`` (full-step X(dt) advection).
+
+    Same scatter pattern as ``semilag_x_adjoint_kernel`` but uses the
+    full-step foot-of-characteristic ``-vs[j] * dt`` (no 0.5 factor).
+    Used by the aggressive merged-Strang backward pass when undoing
+    the inner X(dt) sub-steps.
+    """
+    i, j = wp.tid()
+    x_foot = xs[i] - vs[j] * dt
+    i0, i1, t = _periodic_indices(x_foot, xs[0], dx, nx, period_x)
+    one = wp.float64(1.0)
+    w0 = (one - t) * g_out[i, j]
+    w1 = t * g_out[i, j]
+    wp.atomic_add(g_in, i0, j, w0)
+    wp.atomic_add(g_in, i1, j, w1)
+
+
 # ===========================================================================
 # AGGRESSIVE KERNELS (F5 + M3)
 # ===========================================================================
