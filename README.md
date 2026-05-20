@@ -1,4 +1,4 @@
-# vlasov-poisson-warp
+# warp_vp_solver
 
 A 1D-1V Vlasov-Poisson semi-Lagrangian solver built on
 [NVIDIA Warp](https://github.com/NVIDIA/warp).
@@ -11,8 +11,8 @@ gradient-based optimization through the solver.
 ## Install
 
 ```bash
-git clone https://github.com/Forgotten/vlasov-poisson-warp.git
-cd vlasov-poisson-warp
+git clone https://github.com/Forgotten/warp_vp_solver.git
+cd warp_vp_solver
 pip install -e ".[dev,notebooks]"
 ```
 

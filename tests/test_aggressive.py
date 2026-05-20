@@ -20,7 +20,9 @@ to ``O(dx^2 * dt)``.  These tests verify:
   * the equilibrium distribution is a fixed point;
   * ``record_history=False`` returns ``f_hist=None``;
   * ``aggressive=True`` requires ``optimized=True``;
-  * ``jax.grad`` raises ``NotImplementedError`` on aggressive solvers.
+  * ``jax.grad`` flows through every aggressive layout (via the
+    merged-Strang discrete adjoint) and agrees with a centered
+    finite-difference probe in every layout / parameter combination.
 """
 
 from __future__ import annotations

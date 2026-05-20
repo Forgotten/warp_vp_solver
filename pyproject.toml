@@ -40,8 +40,8 @@ notebooks = [
 ]
 
 [project.urls]
-homepage = "https://github.com/Forgotten/vlasov-poisson-warp"
-repository = "https://github.com/Forgotten/vlasov-poisson-warp"
+homepage = "https://github.com/Forgotten/warp_vp_solver"
+repository = "https://github.com/Forgotten/warp_vp_solver"
 
 [build-system]
 requires = ["flit_core >=3.8,<4"]
